@@ -169,7 +169,12 @@ void TrulySeamless3D::extractTransitionFunction(FaceHandle fh)
             }
 
             auto u0_t = min_transition.transform_point(u0);
-            auto t = u1 - u0_t;
+            auto tu = u1 - u0_t;
+            auto v0_t = min_transition.transform_point(v0);
+            auto tv = v1 - v0_t;
+            auto w0_t = min_transition.transform_point(w0);
+            auto tw = w1 - w0_t;
+            auto t = tu != Vec3d(0, 0, 0) ? tu : (tv != Vec3d(0,0,0) ? tv : tw);
 
             setTranslation(min_transition, t);
 
@@ -310,10 +315,6 @@ void TrulySeamless3D::calculateEdgeSingularity(EdgeHandle eh)
         if (tranFun == identity)
         {
             edgeSingularity[eh] = edgeValences[eh] > 6;
-            if (edgeValences[eh] > 6)
-            {
-                edgeSingularity[eh] = false;
-            }
             return;
         }
         else
@@ -440,61 +441,6 @@ bool TrulySeamless3D::faceContainsEdge(HalfFaceHandle hf, VertexHandle& v1, Vert
     return false;
 }
 
-std::vector<HalfFaceHandle> TrulySeamless3D::halffacesAroundHalfedge(HalfEdgeHandle he)
-{
-    std::vector<HalfFaceHandle> f_vec;
-
-    for (auto hehfIt = inputMesh.hehf_iter(he); hehfIt.valid(); ++hehfIt)
-        f_vec.push_back(*hehfIt);
-    return f_vec;
-
-    auto e = inputMesh.halfedge(he);
-    auto v1 = e.from_vertex();
-    auto v2 = e.to_vertex();
-
-    HalfFaceHandle f_start;
-    for (auto hehfIt = inputMesh.hehf_iter(he); hehfIt.valid(); ++hehfIt)
-    {
-        f_start = *hehfIt;
-        auto fh = inputMesh.face_handle(*hehfIt);
-        if (inputMesh.is_boundary(fh))
-            break;
-    }
-
-    if (inputMesh.is_boundary(f_start))
-        f_start = inputMesh.opposite_halfface_handle(f_start);
-
-    HalfFaceHandle f_end = f_start;
-    do
-    {
-        f_vec.push_back(f_start);
-        if (inputMesh.is_boundary(f_start))
-            break;
-        bool found = false;
-        auto ch = inputMesh.incident_cell(f_start);
-        for (auto f : inputMesh.cell(ch).halffaces())
-        {
-            if (f == f_start)
-                continue;
-            if (faceContainsEdge(f, v1, v2))
-            {
-                found = true;
-                f_start = inputMesh.opposite_halfface_handle(f);
-                break;
-            }
-        }
-        if (!found)
-        {
-#ifndef TRULYSEAMLESS_SILENT
-            std::cout << "ERROR: halffacesAroundHalfedge() - No neighbouring face?" << std::endl;
-#endif
-            m_failFlag = true;
-            return {};
-        }
-    } while (f_start != f_end);
-    return f_vec;
-}
-
 HalfFaceHandle TrulySeamless3D::otherEdgeFace(HalfFaceHandle& hf, HalfEdgeHandle he)
 {
     if (inputMesh.is_boundary(hf))
@@ -609,9 +555,8 @@ void TrulySeamless3D::markSheets()
 
 void TrulySeamless3D::markBranches()
 {
-    // Mark Branches: Singularity OR ...
-    // Boundary: #non-identity-faces > 2 OR different alignment faces
-    // Otherwise: #non-identity-faces != 0, 2
+    // Mark Branches: Singularity OR feature OR surrounded by nonmanifold sheets
+    // OR on single sheet boundary OR different alignment faces
     for (auto e_it = inputMesh.edges_begin(); e_it != inputMesh.edges_end(); ++e_it)
     {
         m_branches[*e_it] = -2;
@@ -628,20 +573,41 @@ void TrulySeamless3D::markBranches()
         }
 
         int sheet_count = 0;
-        std::set<int> alignments;
+        vector<Vec3d> parameterNormals;
         auto he = inputMesh.halfedge_handle(*e_it, 0);
-        std::vector<HalfFaceHandle> fvec = halffacesAroundHalfedge(he);
-        for (auto hfx : fvec)
+        auto hf1 = *inputMesh.hehf_iter(he);
+        auto hf = hf1;
+        auto tranFun = identity;
+        do
         {
-            auto fh = inputMesh.face_handle(hfx);
-            if (-1 == m_sheet[fh])
+            auto f = inputMesh.face_handle(hf);
+            if (-1 == m_sheet[f])
             {
                 sheet_count++;
-                alignments.insert(m_alignmentType[fh]);
+                if (m_alignmentType[f] > SHEET_NONE)
+                {
+                    auto normal = tranFun.inverted().transform_vector(getParameterNormal(hf));
+                    if (inputMesh.is_boundary(hf))
+                        normal *= -1;
+                    parameterNormals.push_back(normal);
+                }
             }
+            if (inputMesh.is_boundary(hf))
+                break;
+            hf = inputMesh.adjacent_halfface_in_cell(hf, he);
+            doTransition(hf, tranFun);
+            hf = inputMesh.opposite_halfface_handle(hf);
+        } while (hf != hf1);
+        bool multiAlign = false;
+        for (int i = 1; i < parameterNormals.size(); i++)
+            if (std::abs(parameterNormals[0] | parameterNormals[i]) < 0.5)
+            {
+                multiAlign = true;
+                break;
         }
 
-        if (1 == sheet_count || sheet_count > 2 || alignments.size() > 1)
+
+        if (1 == sheet_count || sheet_count > 2 || multiAlign)
             m_branches[*e_it] = -1;
     }
 
@@ -671,6 +637,9 @@ void TrulySeamless3D::markBranches()
 void TrulySeamless3D::markNodes()
 {
     // Mark nodes: 1 or more than 2 branch edges are incident
+    // OR just a single feature edge or single singular edge
+    // OR any vertex-nonmanifold configuration
+    // OR two differently aligned/singular branch edge
     // If node => mark its variables in its cells
     m_nodeSectorCount = 0;
     int node_count = 0;
@@ -678,11 +647,104 @@ void TrulySeamless3D::markNodes()
     {
         m_node[*v_it] = false;
         int n_branches = 0;
-        bool singularity_branch = false;
-        bool non_singularity_branch = false;
-        int internal_branches = 0;
-        std::set<int> alignments;
+        int n_alignbranches = 0;
+        for (auto eOut : inputMesh.vertex_edges(*v_it))
+        {
+            if (m_branches[eOut] == -1)
+            {
+                n_branches++;
+                if (isSingularEdge(eOut) || m_edgeFeature[eOut])
+                n_alignbranches++;
+            }
+        }
+        if ((n_branches != 0 && n_branches != 2) || (n_alignbranches != 0 && n_alignbranches != 2))
+        {
+            node_count++;
+            markNode(*v_it);
+            continue;
+        }
 
+        vector<vector<FH>> components;
+        vector<bool> isValidComponent;
+        std::set<FH> fsVisited;
+        std::set<EH> esVisited;
+        for (auto f0 : inputMesh.vertex_faces(*v_it))
+        {
+            if (-1 != m_sheet[f0] || fsVisited.count(f0))
+                continue;
+            std::list<FH> fQ({f0});
+            fsVisited.insert(f0);
+            components.push_back({{f0}});
+            isValidComponent.push_back(false);
+            int nNonManifold = 0;
+            while (!fQ.empty())
+            {
+                auto f = fQ.front();
+                fQ.pop_front();
+
+                for (auto e: inputMesh.face_edges(f))
+                {
+                    auto vs = inputMesh.edge_vertices(e);
+                    if (vs[0] != *v_it && vs[1] != *v_it)
+                        continue;
+                    int valence = 2;
+                    if (-1 == m_branches[e])
+                    {
+                        esVisited.insert(e);
+                        valence = 0;
+                        for (auto fOther: inputMesh.edge_faces(e))
+                            if (-1 == m_sheet[fOther])
+                                valence++;
+                        if (valence > 2)
+                            nNonManifold++;
+                    }
+                    if (valence == 2)
+                    {
+                        for (auto fNext : inputMesh.edge_faces(e))
+                        {
+                            if (-1 == m_sheet[fNext] && !fsVisited.count(fNext))
+                            {
+                                fsVisited.insert(fNext);
+                                fQ.push_back(fNext);
+                                components.back().push_back(fNext);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if (nNonManifold == 2)
+                isValidComponent.back() = true;
+        }
+        if (components.size() >= 1)
+        {
+            bool invalid = false;
+            for (auto e : inputMesh.vertex_edges(*v_it))
+                if (-1 == m_branches[e] && !esVisited.count(e))
+                {
+                    // std::cout << "Dangling branch causing node" << std::endl;
+                    invalid = true;
+                    break;
+                }
+
+            if (!invalid && components.size() > 1)
+                for (bool valid : isValidComponent)
+                    if (!valid)
+                    {
+                        // std::cout << "Nonmanifoldness causing node" << std::endl;
+                        invalid = true;
+                        break;
+                    }
+
+            if (invalid)
+            {
+                node_count++;
+                markNode(*v_it);
+                continue;
+            }
+        }
+
+        std::set<int> alignments;
         std::set<CH> tets;
         for (auto tet : inputMesh.vertex_cells(*v_it))
             tets.insert(tet);
@@ -711,39 +773,42 @@ void TrulySeamless3D::markNodes()
             }
         }
 
-        bool hasFeatureBranch = false;
-        bool hasAlignedSheet = false;
-        bool hasCutSheet = false;
-        set<FH> sheetFaces;
-        set<int> nSheetFaces;
+        // bool singularity_branch = false;
+        // bool non_singularity_branch = false;
+        // int internal_branches = 0;
+        // bool hasFeatureBranch = false;
+        // bool hasAlignedSheet = false;
+        // bool hasCutSheet = false;
+        // set<FH> sheetFaces;
+        // set<int> nSheetFaces;
         for (auto voh_it = inputMesh.voh_iter(*v_it); voh_it.valid(); ++voh_it)
         {
             auto e = inputMesh.edge_handle(*voh_it);
-            int n = 0;
-            for (auto f : inputMesh.edge_faces(e))
-                if (m_sheet[f] > -2)
-                {
-                    if (m_alignmentType[f] > -1)
-                        hasAlignedSheet = true;
-                    else
-                        hasCutSheet = true;
-                    sheetFaces.insert(f);
-                    n++;
-                }
-            nSheetFaces.insert(n);
+            // int n = 0;
+            // for (auto f : inputMesh.edge_faces(e))
+            //     if (m_sheet[f] > -2)
+            //     {
+            //         if (m_alignmentType[f] > -1)
+            //             hasAlignedSheet = true;
+            //         else
+            //             hasCutSheet = true;
+            //         sheetFaces.insert(f);
+            //         n++;
+            //     }
+            // nSheetFaces.insert(n);
 
             if (-1 == m_branches[e])
             {
-                n_branches++;
-                if (isSingularEdge(e))
-                    singularity_branch = true;
-                else
-                    non_singularity_branch = true;
-                if (m_edgeFeature[e])
-                    hasFeatureBranch = true;
-                if (inputMesh.is_boundary(*v_it) && !inputMesh.is_boundary(*voh_it))
-                    internal_branches++;
-                if (m_edgeFeature[e] && !isSingularEdge(e))
+                // n_branches++;
+                // if (isSingularEdge(e))
+                //     singularity_branch = true;
+                // else
+                //     non_singularity_branch = true;
+                // if (m_edgeFeature[e])
+                //     hasFeatureBranch = true;
+                // if (inputMesh.is_boundary(*v_it) && !inputMesh.is_boundary(*voh_it))
+                //     internal_branches++;
+                if (m_edgeFeature[e] || isSingularEdge(e))
                 {
                     int alignment = m_branchType[e];
                     Vec3d in(0, 0, 0);
@@ -757,25 +822,21 @@ void TrulySeamless3D::markNodes()
             }
         }
 
-        // To debug: mark all feature vs as nodes
-        if (1 == n_branches || n_branches > 2 || (singularity_branch && non_singularity_branch) || internal_branches > 0
-            || alignments.size() > 1)
+        if (alignments.size() > 1)
         {
             node_count++;
             markNode(*v_it);
         }
-        // TODO this may still be overly strict, test
-        else if (!inputMesh.is_boundary(*v_it) && hasAlignedSheet && hasCutSheet && n_branches == 0)
-        {
-            node_count++;
-            markNode(*v_it);
-        }
-        // TODO this may be overly strict (or possibly not strict enough), test
-        else if (!inputMesh.is_boundary(*v_it) && hasFeatureBranch && nSheetFaces.size() > 1)
-        {
-            node_count++;
-            markNode(*v_it);
-        }
+        // else if (!inputMesh.is_boundary(*v_it) && hasAlignedSheet && hasCutSheet && n_branches == 0)
+        // {
+        //     node_count++;
+        //     markNode(*v_it);
+        // }
+        // else if (!inputMesh.is_boundary(*v_it) && hasFeatureBranch && nSheetFaces.size() > 1)
+        // {
+        //     node_count++;
+        //     markNode(*v_it);
+        // }
     }
 
 #ifndef TRULYSEAMLESS_SILENT
@@ -2357,7 +2418,7 @@ bool TrulySeamless3D::checkSeamlessness()
         std::cout << "Total singular Edges: " << e_singularAlign << " and feature edges: " << e_featureAlign << endl;
         std::cout << (m_algorithmFinished ? "ERROR" : "INFO" ) << ": Misaligned singular edges: " << bad_singularAlign << endl;
         std::cout << (m_algorithmFinished ? "ERROR" : "INFO" ) << ": Misaligned feature edges: " << bad_featureAlign << endl;
-        std::cout << (m_algorithmFinished ? "ERROR" : "INFO" ) << ": Alignment Faces: " << bad_alignment << endl;
+        std::cout << (m_algorithmFinished ? "ERROR" : "INFO" ) << ": Misaligned boundary/feature Faces: " << bad_alignment << endl;
         std::cout << (m_algorithmFinished ? "ERROR" : "INFO" ) << ": " << v_count << " vertices not seamless across " << bad_cut << " cut faces and "
                   << bad_identity << " identity faces\n"
                   << endl;
